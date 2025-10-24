@@ -1,10 +1,31 @@
+import json
 import torch
-from transformers import AutoTokenzier
+from transformers import AutoTokenizer
 from src.baseline import Qwen3ForCausalLM, Qwen3MoEConfig
 
+model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
-config = Qwen3MoEConfig(vocab_size=1000, hidden_size=512, num_hidden_layers=2, num_experts=4)
-model = Qwen3ForCausalLM(config)
+with open("src/config.json") as f:
+    raw = json.load(f)
+
+cfg = Qwen3MoEConfig(
+    vocab_size = raw["vocab_size"],
+    hidden_size = raw["hidden_size"],
+    intermediate_size = raw["intermediate_size"],
+    num_hidden_layers = raw["num_hidden_layers"],
+    num_attention_heads = raw["num_attention_heads"],
+    num_key_value_heads = raw["num_key_value_heads"],
+    head_dim = raw["head_dim"],
+    num_experts = raw["num_experts"],
+    num_experts_per_tok = raw["num_experts_per_tok"],
+    rms_norm_eps = raw["rms_norm_eps"],
+    rope_theta = raw["rope_theta"],
+    norm_topk_prob = raw["norm_topk_prob"],
+    router_aux_loss_coef = raw["router_aux_loss_coef"],
+)
+
+model = Qwen3ForCausalLM(cfg)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 text = "what is 2+2?"
 
 def chat(text):

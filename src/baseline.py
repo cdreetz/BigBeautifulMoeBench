@@ -12,35 +12,26 @@ from dataclasses import dataclass
 
 @dataclass
 class Qwen3MoEConfig:
-    """Configuration for Qwen3-30B-A3B-Instruct-2507
-    
-    Architecture verified from HuggingFace model card:
-    - 30.5B total parameters, 3.3B activated per token
-    - 48 layers, 128 experts (8 active), no shared experts in this version
-    - GQA: 32 query heads, 4 key-value heads
-    - Context: 262K native, 1M with YaRN
-    """
-    vocab_size: int = 151936
-    hidden_size: int = 3584
-    intermediate_size: int = 18944  # per expert FFN
-    num_hidden_layers: int = 48
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 4
-    head_dim: int = 128
-    num_experts: int = 128
-    num_experts_per_tok: int = 8
-    max_position_embeddings: int = 262144
-    rope_theta: float = 1000000.0
-    rms_norm_eps: float = 1e-6
+    """Configuration for Qwen3 MoE models - no defaults, must be initialized from HF config"""
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    num_experts: int
+    num_experts_per_tok: int
+    max_position_embeddings: int
+    rope_theta: float
+    rms_norm_eps: float
+    moe_intermediate_size: int
+    shared_expert_intermediate_size: int
     hidden_act: str = "silu"
     attention_dropout: float = 0.0
-    moe_intermediate_size: int = 2560  # shared expert size (may not be used)
-    shared_expert_intermediate_size: int = 2560
     norm_topk_prob: bool = False
     router_aux_loss_coef: float = 0.001
-    use_shared_expert: bool = True  # Can disable for cleaner baseline
-    
-
+    use_shared_expert: bool = False  # CHANGED DEFAULT TO FALSE
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
@@ -100,7 +91,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
 
 
 class Qwen3Attention(nn.Module):
-    """Multi-head attention with GQA support"""
+    """Multi-head attention with GQA support and Q/K normalization"""
     def __init__(self, config: Qwen3MoEConfig):
         super().__init__()
         self.config = config
@@ -115,6 +106,10 @@ class Qwen3Attention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        
+        # KEY FIX: Add Q/K normalization layers
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
@@ -139,6 +134,10 @@ class Qwen3Attention(nn.Module):
         query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
+        # KEY FIX: Apply Q/K normalization BEFORE RoPE
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
         
         # Apply rotary embeddings
         cos, sin = self.rotary_emb(value_states, position_ids)
@@ -165,12 +164,12 @@ class Qwen3Attention(nn.Module):
         return attn_output
 
 
-class Qwen3MLP(nn.Module):
-    """Single expert MLP"""
+class Qwen3ExpertMLP(nn.Module):
+    """Single expert MLP - uses moe_intermediate_size"""
     def __init__(self, config: Qwen3MoEConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = config.moe_intermediate_size
         
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -183,7 +182,7 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3MoE(nn.Module):
-    """Mixture of Experts layer"""
+    """Mixture of Experts layer - NO SHARED EXPERT for Qwen3-30B-A3B"""
     def __init__(self, config: Qwen3MoEConfig):
         super().__init__()
         self.num_experts = config.num_experts
@@ -194,12 +193,14 @@ class Qwen3MoE(nn.Module):
         # Router (gate)
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         
-        # Experts - naive implementation with a list
-        self.experts = nn.ModuleList([Qwen3MLP(config) for _ in range(self.num_experts)])
+        # Experts - using the CORRECT expert MLP class
+        self.experts = nn.ModuleList([
+            Qwen3ExpertMLP(config) for _ in range(self.num_experts)
+        ])
         
-        # Shared expert (optional, Qwen3 has this)
-        self.shared_expert = Qwen3MLP(config)
-        self.shared_expert_gate = nn.Linear(self.hidden_size, 1, bias=False)
+        # KEY FIX: NO SHARED EXPERT for this model!
+        # The Qwen3-30B-A3B-Instruct-2507 model does NOT have shared experts
+        # (unlike Qwen2-MoE which does)
         
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_length, hidden_dim = hidden_states.shape
@@ -220,57 +221,38 @@ class Qwen3MoE(nn.Module):
         # Initialize output
         final_hidden_states = torch.zeros_like(hidden_states_flat)
         
-        # NAIVE IMPLEMENTATION - Loop over experts (THIS IS WHAT WE'LL OPTIMIZE)
-        # This is the slow part that FlashDMoE aims to fix
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-        
+        # Process each expert
         for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+            # Find tokens routed to this expert
+            expert_mask = (selected_experts == expert_idx).any(dim=-1)
             
-            if top_x.shape[0] == 0:
-                continue
+            if expert_mask.any():
+                expert_input = hidden_states_flat[expert_mask]
+                expert_output = self.experts[expert_idx](expert_input)
                 
-            # Get tokens for this expert
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
-            
-            current_state = hidden_states_flat[None, top_x_list].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state)
-            
-            # Weighted by routing weights
-            current_hidden_states = current_hidden_states * routing_weights[top_x_list, idx_list, None]
-            
-            # Accumulate
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                # Get routing weights for this expert
+                token_indices = expert_mask.nonzero(as_tuple=True)[0]
+                expert_weights = routing_weights[expert_mask]
+                expert_positions = (selected_experts[expert_mask] == expert_idx).nonzero(as_tuple=True)[1]
+                weights = expert_weights[torch.arange(len(expert_weights)), expert_positions]
+                
+                # Add weighted output
+                final_hidden_states[token_indices] += expert_output * weights.unsqueeze(-1)
         
-        # Shared expert
-        shared_output = self.shared_expert(hidden_states_flat)
-        shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states_flat))
-        final_hidden_states = final_hidden_states + shared_gate * shared_output
+        # Reshape back
+        final_hidden_states = final_hidden_states.view(batch_size, seq_length, hidden_dim)
         
-        final_hidden_states = final_hidden_states.reshape(batch_size, seq_length, hidden_dim)
+        # Compute auxiliary loss
+        aux_loss = self._compute_router_aux_loss(router_logits, selected_experts)
         
-        # Return auxiliary loss for load balancing
-        router_aux_loss = self._compute_router_aux_loss(router_logits, selected_experts)
-        
-        return final_hidden_states, router_aux_loss
+        return final_hidden_states, aux_loss
     
     def _compute_router_aux_loss(self, router_logits, selected_experts):
         """Compute auxiliary load balancing loss"""
-        # Simple load balancing loss
-        num_tokens = router_logits.shape[0]
         router_probs = F.softmax(router_logits, dim=-1)
-        
-        # Average probability per expert
         expert_usage = router_probs.mean(dim=0)
-        
-        # We want uniform distribution
         target = 1.0 / self.num_experts
-        
-        # L2 loss
         aux_loss = torch.mean((expert_usage - target) ** 2)
-        
         return aux_loss
 
 
@@ -321,7 +303,9 @@ class Qwen3Model(nn.Module):
         self.vocab_size = config.vocab_size
         
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
     def forward(
@@ -430,35 +414,3 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             
         return input_ids
-
-
-# Test script
-if __name__ == "__main__":
-    print("Creating Qwen3-30B-A3B model (pure PyTorch)...")
-    
-    config = Qwen3MoEConfig()
-    model = Qwen3ForCausalLM(config)
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    print(f"Total parameters: {total_params / 1e9:.2f}B")
-    print(f"Trainable parameters: {trainable_params / 1e9:.2f}B")
-    
-    # Test forward pass
-    batch_size = 2
-    seq_len = 128
-    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
-    
-    print(f"\nRunning forward pass with batch_size={batch_size}, seq_len={seq_len}...")
-    
-    with torch.no_grad():
-        outputs = model(input_ids)
-    
-    print(f"Logits shape: {outputs['logits'].shape}")
-    print(f"Router aux loss: {outputs['router_aux_loss']:.6f}")
-    
-    print("\n✓ Model created successfully!")
-    print("This is your BASELINE - pure PyTorch, no optimizations")
-    print("Now you can start converting modules to Triton kernels!")

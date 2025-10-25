@@ -50,40 +50,57 @@ for file in sorted(os.listdir(cache_dir)):
         ))
 
 model.load_state_dict(state_dict, assign=True, strict=False)
+
+# Check what dtype the weights are
+sample_weight = next(model.parameters())
+print(f"Model weights dtype: {sample_weight.dtype}")
+print(f"Model weights device: {sample_weight.device}")
+
 model.eval()
 print("Model loaded.\n")
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-def chat(text, max_tokens=100, temperature=0.7):
-    messages = [{"role": "user", "content": text}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    
-    for _ in range(max_tokens):
-        with torch.no_grad():
-            outputs = model(input_ids)
-            logits = outputs['logits'][0, -1, :] / temperature
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-            
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
-    
-    response = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-    # Extract only the assistant's response
-    if "<|im_start|>assistant" in response:
-        response = response.split("<|im_start|>assistant")[-1].strip()
-    
-    return response
+# Simple test
+messages = [{"role": "user", "content": "what is 2+2?"}]
+prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
-if __name__ == "__main__":
-    # Test
-    print("Q: what is 2+2?")
-    print(f"A: {chat('what is 2+2?', max_tokens=50)}\n")
+print(f"Input shape: {input_ids.shape}")
+print(f"Input dtype: {input_ids.dtype}")
+
+# Single forward pass
+with torch.no_grad():
+    print("\nRunning forward pass...")
+    outputs = model(input_ids)
+    logits = outputs['logits']
     
-    print("Q: Explain why the sky is blue in one sentence.")
-    print(f"A: {chat('Explain why the sky is blue in one sentence.', max_tokens=100)}\n")
+    print(f"Logits shape: {logits.shape}")
+    print(f"Logits dtype: {logits.dtype}")
+    print(f"Logits device: {logits.device}")
+    print(f"Logits min: {logits.min().item():.4f}")
+    print(f"Logits max: {logits.max().item():.4f}")
+    print(f"Logits mean: {logits.mean().item():.4f}")
+    print(f"Logits has NaN: {torch.isnan(logits).any().item()}")
+    print(f"Logits has Inf: {torch.isinf(logits).any().item()}")
+    
+    # Try softmax
+    last_logits = logits[0, -1, :].float()
+    print(f"\nLast token logits shape: {last_logits.shape}")
+    print(f"Last token logits min: {last_logits.min().item():.4f}")
+    print(f"Last token logits max: {last_logits.max().item():.4f}")
+    
+    probs = torch.nn.functional.softmax(last_logits, dim=-1)
+    print(f"Probs min: {probs.min().item():.10f}")
+    print(f"Probs max: {probs.max().item():.10f}")
+    print(f"Probs sum: {probs.sum().item():.10f}")
+    print(f"Probs has NaN: {torch.isnan(probs).any().item()}")
+    print(f"Probs has Inf: {torch.isinf(probs).any().item()}")
+    print(f"Probs has negative: {(probs < 0).any().item()}")
+    
+    # Try to sample
+    print("\nAttempting to sample...")
+    next_token = torch.multinomial(probs, num_samples=1)
+    print(f"Sampled token: {next_token.item()}")
+    print(f"Token text: {tokenizer.decode([next_token.item()])}")
